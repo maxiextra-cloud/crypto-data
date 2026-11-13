@@ -4,6 +4,14 @@
 Coinonként sorban próbálja a forrásokat (Bybit -> Binance -> OKX -> Kraken),
 és az első működő adatait összefésüli a data/ohlcv.csv fájllal.
 A még le nem zárt (mai, UTC) gyertyát kihagyja.
+
+2. rész (best effort, hibatűrő): piaci kiegészítők a data/ mappába:
+  market.csv       napi pillanatkép: Fear & Greed, BTC-dominancia, teljes kapitalizáció,
+                   BTC/ETH/SOL funding (8 órás) és open interest, US 2Y/10Y, DXY, EUR/USD
+  fng.csv          Fear & Greed teljes története
+  stablecoins.csv  stablecoin-kínálat teljes története (DefiLlama)
+  treasury.csv     amerikai állampapírhozamok (idei év, napi)
+Hogy melyik forrás működött, az a data/status.json "extras" mezőjében látszik.
 """
 import csv, json, os, sys, time, urllib.request
 from datetime import datetime, timezone
@@ -16,6 +24,19 @@ FIELDS = ["date", "coin", "open", "high", "low", "close", "volume", "source"]
 
 def get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (price-fetcher)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read().decode())
+
+
+def get_text(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (price-fetcher)"})
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def post(url, body):
+    req = urllib.request.Request(url, data=json.dumps(body).encode(),
+                                 headers={"User-Agent": "Mozilla/5.0 (price-fetcher)", "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode())
 
@@ -94,12 +115,176 @@ def main():
         for k in sorted(data):
             w.writerow(data[k])
     last = max((k[0] for k in data), default="-")
+    try:
+        ex = extras(today)
+    except Exception as e:  # a kiegészítők hibája nem állíthatja meg az árfolyamokat
+        ex = {"extras": "hiba: " + str(e)[:100]}
     with open(os.path.join("data", "status.json"), "w") as f:
         json.dump({"updated_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                   "last_date": last, "rows": len(data), "failed": failed}, f)
+                   "last_date": last, "rows": len(data), "failed": failed, "extras": ex}, f)
     print(f"Kész: {len(data)} sor, utolsó nap {last}, sikertelen: {failed or 'nincs'}")
     if len(failed) == len(COINS):
         sys.exit(1)
+
+
+# ---------------------------------------------------------------- 2. rész: kiegészítők
+def write_csv(name, fields, rows):
+    os.makedirs("data", exist_ok=True)
+    with open(os.path.join("data", name), "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+
+def read_csv(name):
+    p = os.path.join("data", name)
+    if not os.path.exists(p):
+        return []
+    with open(p, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def parse_fng(j):
+    return sorted(({"date": day(int(r["timestamp"]) * 1000), "value": r["value"], "label": r["value_classification"]}
+                   for r in j["data"]), key=lambda r: r["date"])
+
+
+def parse_global_cg(j):
+    d = j["data"]
+    return {"btc_dom": round(d["market_cap_percentage"]["btc"], 2), "total_mcap_usd": round(d["total_market_cap"]["usd"]), "global_src": "coingecko"}
+
+
+def parse_global_cp(j):
+    return {"btc_dom": round(j["bitcoin_dominance_percentage"], 2), "total_mcap_usd": round(j["market_cap_usd"]), "global_src": "coinpaprika"}
+
+
+def parse_stables(j):
+    out = []
+    for r in j:
+        v = (r.get("totalCirculatingUSD") or r.get("totalCirculating") or {}).get("peggedUSD")
+        if v:
+            out.append({"date": day(int(r["date"]) * 1000), "total_usd": round(v)})
+    return out
+
+
+def parse_treasury(text):
+    out = []
+    for r in csv.DictReader(text.splitlines()):
+        m, d, y = r["Date"].split("/")
+        out.append({"date": f"{y}-{m.zfill(2)}-{d.zfill(2)}", "us2y": r.get("2 Yr", ""), "us10y": r.get("10 Yr", ""), "us30y": r.get("30 Yr", "")})
+    return sorted(out, key=lambda r: r["date"])
+
+
+def parse_stooq(text):
+    rows = list(csv.DictReader(text.splitlines()))
+    last = rows[-1]
+    return last["Date"], float(last["Close"])
+
+
+def deriv_okx(c):
+    f = get(f"https://www.okx.com/api/v5/public/funding-rate?instId={c}-USDT-SWAP")["data"][0]
+    o = get(f"https://www.okx.com/api/v5/public/open-interest?instType=SWAP&instId={c}-USDT-SWAP")["data"][0]
+    oi = o.get("oiUsd")
+    return float(f["fundingRate"]), (round(float(oi)) if oi else ""), "okx"
+
+
+def parse_hl(j, c):
+    names = [u["name"] for u in j[0]["universe"]]
+    x = j[1][names.index(c)]
+    return float(x["funding"]) * 8, round(float(x["openInterest"]) * float(x["markPx"])), "hyperliquid"
+
+
+def deriv_hl(c):
+    return parse_hl(post("https://api.hyperliquid.xyz/info", {"type": "metaAndAssetCtxs"}), c)
+
+
+def deriv_deribit(c):
+    inst = {"BTC": "BTC-PERPETUAL", "ETH": "ETH-PERPETUAL", "SOL": "SOL_USDC-PERPETUAL"}[c]
+    r = get(f"https://www.deribit.com/api/v2/public/ticker?instrument_name={inst}")["result"]
+    oi = r["open_interest"] if c != "SOL" else r["open_interest"] * r["mark_price"]
+    return float(r["funding_8h"]), round(oi), "deribit"
+
+
+def extras(today):
+    st, row = {}, {"date": today}
+
+    def step(name, fn):
+        try:
+            fn()
+            st[name] = "ok"
+        except Exception as e:
+            st[name] = "hiba: " + str(e)[:100]
+        print(f"{name}: {st[name]}")
+
+    def fng():
+        rows = parse_fng(get("https://api.alternative.me/fng/?limit=0"))
+        write_csv("fng.csv", ["date", "value", "label"], rows)
+        row["fng"], row["fng_date"] = rows[-1]["value"], rows[-1]["date"]
+
+    def glob():
+        try:
+            row.update(parse_global_cg(get("https://api.coingecko.com/api/v3/global")))
+        except Exception:
+            row.update(parse_global_cp(get("https://api.coinpaprika.com/v1/global")))
+
+    def stables():
+        rows = parse_stables(get("https://stablecoins.llama.fi/stablecoincharts/all"))
+        write_csv("stablecoins.csv", ["date", "total_usd"], rows)
+        row["stables_usd"] = rows[-1]["total_usd"]
+
+    def treasury():
+        y = today[:4]
+        t = get_text("https://home.treasury.gov/resource-center/data-chart-center/interest-rates/daily-treasury-rates.csv/"
+                     f"{y}/all?type=daily_treasury_yield_curve&field_tdr_date_value={y}&page&_format=csv")
+        rows = parse_treasury(t)
+        old = {r["date"]: r for r in read_csv("treasury.csv")}
+        old.update({r["date"]: r for r in rows})
+        write_csv("treasury.csv", ["date", "us2y", "us10y", "us30y"], [old[k] for k in sorted(old)])
+        row["us2y"], row["us10y"], row["ust_date"] = rows[-1]["us2y"], rows[-1]["us10y"], rows[-1]["date"]
+
+    def fx():
+        errs = []
+        for key, syms in (("dxy", ["dx.f", "usd_i"]), ("eurusd", ["eurusd"])):
+            for s in syms:
+                try:
+                    d, v = parse_stooq(get_text(f"https://stooq.com/q/d/l/?s={s}&i=d"))
+                    row[key], row[key + "_date"] = v, d
+                    break
+                except Exception as e:
+                    errs.append(f"{s}: {str(e)[:40]}")
+        if "dxy" not in row and "eurusd" not in row:
+            raise ValueError("; ".join(errs))
+
+    def make_deriv(c):
+        def f():
+            errs = []
+            for fn in (deriv_okx, deriv_hl, deriv_deribit):
+                try:
+                    fr, oi, src = fn(c)
+                    row[f"{c.lower()}_funding_8h"], row[f"{c.lower()}_oi_usd"], row[f"{c.lower()}_deriv_src"] = fr, oi, src
+                    return
+                except Exception as e:
+                    errs.append(f"{fn.__name__}: {str(e)[:40]}")
+            raise ValueError("; ".join(errs))
+        return f
+
+    step("fng", fng)
+    step("global", glob)
+    step("stablecoins", stables)
+    step("treasury", treasury)
+    step("fx", fx)
+    for c in ("BTC", "ETH", "SOL"):
+        step("deriv_" + c, make_deriv(c))
+
+    fields = ["date", "fng", "fng_date", "btc_dom", "total_mcap_usd", "global_src", "stables_usd",
+              "btc_funding_8h", "btc_oi_usd", "btc_deriv_src", "eth_funding_8h", "eth_oi_usd", "eth_deriv_src",
+              "sol_funding_8h", "sol_oi_usd", "sol_deriv_src", "us2y", "us10y", "ust_date",
+              "dxy", "dxy_date", "eurusd", "eurusd_date"]
+    old = {r["date"]: r for r in read_csv("market.csv")}
+    old[today] = row
+    write_csv("market.csv", fields, [old[k] for k in sorted(old)])
+    return st
 
 
 if __name__ == "__main__":
