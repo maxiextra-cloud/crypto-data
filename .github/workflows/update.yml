@@ -1,0 +1,24 @@
+
+Update · YML
+name: Napi arfolyam-frissites
+on:
+  schedule:
+    - cron: "40 0 * * *"   # minden nap 00:40 UTC, a napi zaras utan
+  workflow_dispatch:        # kezzel is indithato az Actions fulon
+permissions:
+  contents: write
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python fetch_prices.py
+      - run: |
+          git config user.name "price-bot"
+          git config user.email "price-bot@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet || git commit -m "Napi arfolyamok $(date -u +%F)"
+          git push
