@@ -7,7 +7,7 @@ A még le nem zárt (mai, UTC) gyertyát kihagyja.
 
 2. rész (best effort, hibatűrő): piaci kiegészítők a data/ mappába:
   market.csv       napi pillanatkép: Fear & Greed, BTC-dominancia, teljes kapitalizáció,
-                   BTC/ETH/SOL funding (8 órás) és open interest, US 2Y/10Y, DXY, EUR/USD
+                   BTC/ETH/SOL funding (8 órás) és open interest, US 2Y/10Y, DXY (EKB-árfolyamokból számolva), EUR/USD
   fng.csv          Fear & Greed teljes története
   stablecoins.csv  stablecoin-kínálat teljes története (DefiLlama)
   treasury.csv     amerikai állampapírhozamok (idei év, napi)
@@ -244,17 +244,13 @@ def extras(today):
         row["us2y"], row["us10y"], row["ust_date"] = rows[-1]["us2y"], rows[-1]["us10y"], rows[-1]["date"]
 
     def fx():
-        errs = []
-        for key, syms in (("dxy", ["dx.f", "usd_i"]), ("eurusd", ["eurusd"])):
-            for s in syms:
-                try:
-                    d, v = parse_stooq(get_text(f"https://stooq.com/q/d/l/?s={s}&i=d"))
-                    row[key], row[key + "_date"] = v, d
-                    break
-                except Exception as e:
-                    errs.append(f"{s}: {str(e)[:40]}")
-        if "dxy" not in row and "eurusd" not in row:
-            raise ValueError("; ".join(errs))
+        # EKB napi referencia-árfolyamok (frankfurter.app); a DXY a hivatalos képlettel számolva
+        j = get("https://api.frankfurter.app/latest?from=USD&to=EUR,JPY,GBP,CAD,SEK,CHF")
+        r = j["rates"]
+        row["eurusd"], row["eurusd_date"] = round(1 / r["EUR"], 4), j["date"]
+        dxy = (50.14348112 * (1 / r["EUR"]) ** -0.576 * r["JPY"] ** 0.136 * (1 / r["GBP"]) ** -0.119
+               * r["CAD"] ** 0.091 * r["SEK"] ** 0.042 * r["CHF"] ** 0.036)
+        row["dxy"], row["dxy_date"] = round(dxy, 2), j["date"]
 
     def make_deriv(c):
         def f():
